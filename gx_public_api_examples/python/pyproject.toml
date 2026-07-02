@@ -1,0 +1,17 @@
+[project]
+name = "gx-public-api-python-examples"
+version = "0.1.0"
+description = "Runnable Python examples for the GX Public API"
+requires-python = ">=3.10"
+dependencies = [
+    "websockets==16.0",
+    "aiortc==1.14.0",
+    "opencv-python==4.13.0.92",
+]
+
+[tool.uv]
+package = false
+
+[build-system]
+requires = ["hatchling>=1.24.0"]
+build-backend = "hatchling.build"
