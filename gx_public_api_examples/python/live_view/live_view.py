@@ -1,17 +1,61 @@
 import asyncio
+import bisect
 import json
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 
 import cv2
 import websockets
-from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc import RTCPeerConnection, RTCSessionDescription, rtcrtpreceiver
 from aiortc.sdp import candidate_from_sdp
 
 
 URI = "ws://192.168.1.138:49152"  # Replace with your device IP/host, keep port 49152 and passphrase empty
 GLASSES_CONNECTION_WAIT_SECONDS = 5
+MAX_FRAME_MAPS = 4096
+MAX_GAZE_SAMPLES = 2048
+MAX_GAZE_OFFSET_US = 10_000
 
 SignalHandler = Callable[[dict], Awaitable[None]]
+
+
+class RtpTimestampPassthrough(rtcrtpreceiver.TimestampMapper):
+    def map(self, timestamp: int) -> int:
+        return timestamp
+
+
+rtcrtpreceiver.TimestampMapper = RtpTimestampPassthrough
+
+
+class GazeMatcher:
+    def __init__(self):
+        self._frame_times: OrderedDict[int, int] = OrderedDict()
+        self._gaze_times: list[int] = []
+        self._gaze_points: list[list[float] | None] = []
+
+    def on_message(self, label: str, raw: str):
+        message = json.loads(raw)
+        if label == "timesync" and message.get("type") == "video_frame_map":
+            self._frame_times[message["rtp_timestamp"]] = message["app_timestamp_us"]
+            if len(self._frame_times) > MAX_FRAME_MAPS:
+                self._frame_times.popitem(last=False)
+        elif label == "gaze2d":
+            self._gaze_times.append(message["timestamp_us"])
+            self._gaze_points.append(message["gaze"])
+            if len(self._gaze_times) > MAX_GAZE_SAMPLES:
+                del self._gaze_times[0]
+                del self._gaze_points[0]
+
+    def gaze_for_frame(self, rtp_timestamp: int) -> list[float] | None:
+        frame_time = self._frame_times.get(rtp_timestamp)
+        if frame_time is None or not self._gaze_times:
+            return None
+        index = bisect.bisect_left(self._gaze_times, frame_time)
+        nearby = [i for i in (index - 1, index) if 0 <= i < len(self._gaze_times)]
+        closest = min(nearby, key=lambda i: abs(self._gaze_times[i] - frame_time))
+        if abs(self._gaze_times[closest] - frame_time) > MAX_GAZE_OFFSET_US:
+            return None
+        return self._gaze_points[closest]
 
 
 class GxApiClient:
@@ -114,7 +158,7 @@ class GxApiClient:
             self._signal_handlers.pop(signal_id, None)
 
 
-async def render_video(track):
+async def render_video(track, gaze: GazeMatcher):
     window_name = "GX LiveView"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
@@ -125,6 +169,11 @@ async def render_video(track):
 
             frame = await track.recv()
             image = frame.to_ndarray(format="bgr24")
+            point = gaze.gaze_for_frame(frame.pts)
+            if point is not None:
+                height, width = image.shape[:2]
+                center = (int(point[0] * width), int(point[1] * height))
+                cv2.circle(image, center, 20, (255, 229, 0), 3)
             cv2.imshow(window_name, image)
             cv2.waitKey(1)
             if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
@@ -137,15 +186,23 @@ async def run_liveview(uri: str):
     api = GxApiClient(uri)
     pc = RTCPeerConnection()
     pc.addTransceiver("video", direction="recvonly")
+    gaze = GazeMatcher()
 
     display_task: asyncio.Task | None = None
     remote_signal_id: int | None = None
+    session_created = False
 
     @pc.on("track")
     def on_track(track):
         nonlocal display_task
         if track.kind == "video" and display_task is None:
-            display_task = asyncio.create_task(render_video(track))
+            display_task = asyncio.create_task(render_video(track, gaze))
+
+    @pc.on("datachannel")
+    def on_datachannel(channel):
+        @channel.on("message")
+        def on_message(message):
+            gaze.on_message(channel.label, message)
 
     @pc.on("icecandidate")
     async def on_icecandidate(candidate):
@@ -209,9 +266,13 @@ async def run_liveview(uri: str):
             print("Glasses are not connected. Connect the glasses and try again.")
             return
 
-        created = await api.call_action("live_viewer.session.create")
+        created = await api.call_action(
+            "live_viewer.session.create",
+            [[], ["video", "gaze2d", "timesync"]],
+        )
         if created is not True:
             raise RuntimeError(f"live_viewer.session.create failed: {created}")
+        session_created = True
 
         remote_signal_id = await api.subscribe_signal(
             "live_viewer.ice_candidate.discovered",
@@ -241,10 +302,11 @@ async def run_liveview(uri: str):
         if remote_signal_id is not None:
             await api.unsubscribe_signal(remote_signal_id)
 
-        try:
-            await api.call_action("live_viewer.session.delete")
-        except Exception:
-            pass
+        if session_created:
+            try:
+                await api.call_action("live_viewer.session.delete")
+            except Exception:
+                pass
 
         await pc.close()
         await api.close()

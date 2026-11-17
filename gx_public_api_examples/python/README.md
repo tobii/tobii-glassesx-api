@@ -45,7 +45,7 @@ URI = "ws://192.168.x.y:49152"
 
 Port `49152` is fixed.
 
-If a passphrase is set in Glasses X application, send it in the `X-GX-App-Passphrase` header during the WebSocket upgrade. This applies only to native clients. Browsers can't set custom headers.
+If a passphrase is set in Glasses X application, send it in the `X-GX-App-Passphrase` header during the WebSocket upgrade and with each recording download. This applies only to native clients. Browsers can't set custom headers.
 
 ## Troubleshooting
 
@@ -117,6 +117,23 @@ Starts a recording with `recorder.start`, waits briefly, stops it with `recorder
 uv run python ./action/start_and_stop_recording.py
 ```
 
+### Download a recording
+
+**File:** `recordings/download_recording.py`
+
+Downloads the recording in the last folder of the list that `recordings.list` returns. The list is sorted by folder name, so with the default timestamp names this is the newest recording. The example:
+
+* Lists the saved recordings with `recordings.list`, and stops with an error if there are none.
+* Gets the download paths of the last folder in the list with `recordings.files.list`.
+* Downloads each file with HTTP GET into `downloads/<folder name>`.
+* Sends the passphrase in `PASS_PHRASE` with each request, if you set one.
+
+Glasses X application must be in local mode.
+
+```bash
+uv run python ./recordings/download_recording.py
+```
+
 ### Handle API errors
 
 **File:** `error_handling/handle_api_error_responses.py`
@@ -148,13 +165,16 @@ uv run python ./signal/glasses_isconnected_subscribe_unsubscribe.py
 
 Shows the full WebRTC live view flow:
 
-* Creates a WebRTC session with `live_viewer.session.create`.
+* Creates a WebRTC session with `live_viewer.session.create`. It asks for clean video and the `gaze2d` and `timesync` channels. See [Choose the streams](../../GX_App_Public_API_Guide.md#choose-the-streams) for the other streams.
 * Subscribes to remote ICE candidates with `live_viewer.ice_candidate.discovered`.
 * Gets the SDP offer with `live_viewer.offer.create`.
 * Creates and sends an SDP answer with `live_viewer.session.start`.
 * Exchanges ICE candidates in both directions.
 * Renders incoming video in an OpenCV window.
+* Draws the gaze point from the `gaze2d` and `timesync` data channels over the video.
 * Reports disconnected glasses, setup errors, or missing video tracks in the console.
+
+To match gaze to a frame, the example keeps the latest 4096 `timesync` entries and draws the closest `gaze2d` sample if it is within 10 ms of the frame. By default, `aiortc` changes the RTP timestamps to start at 0, so the example replaces its timestamp mapper to keep them unchanged.
 
 Close the video window to stop. The session is cleaned up automatically.
 
